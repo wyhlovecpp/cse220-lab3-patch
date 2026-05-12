@@ -38,18 +38,21 @@ summary of Jouppi 1990 (DEC WRL TN-14).
 **A. Probe-and-swap on L1 miss.** Inside `update_dcache_stage()`, after
 `cache_access` misses and before `dcache_cacheline_miss`:
 
-1. `victim_cache_take(va, &vc_dirty)` — if TRUE, the line was resident in
-   the VC and has just been removed.
-2. `get_next_repl_line(&dc->dcache, …)` — figure out which L1 line would
-   be evicted to hold the VC-hit line.
-3. `victim_cache_peek_evict(l1_repl_addr, …)` — would pushing that L1
-   victim into the VC evict a dirty LRU? If so, try to schedule a
-   writeback. On failure, undo the `take` and fall through to the normal
-   miss path (deadlock-safe).
-4. Otherwise commit the swap: `cache_insert(&dc->dcache, …)` installs the
-   VC-hit line in L1; `victim_cache_install(l1_repl_addr, l1_victim_dirty, …)`
-   pushes the L1 victim into the VC; call `dcache_cacheline_hit` so the
-   op is completed as an L1 hit.
+1. `get_next_repl_line(&dc->dcache, …)` — find which L1 line would be
+   evicted to hold the VC-hit line, and snapshot its dirty bit BEFORE any
+   `cache_insert` can overwrite the Dcache_Data slot.
+2. `victim_cache_take(va, &vc_dirty)` — probe + remove the VC entry for
+   `va`. On a miss, fall through to the normal `dcache_cacheline_miss`
+   path.
+3. On a VC hit the swap is guaranteed not to displace any other VC entry:
+   `take()` vacated one slot, and the L1 victim fills exactly that slot.
+   So swap-on-hit never issues a writeback.
+4. Commit: `cache_insert(&dc->dcache, …)` installs the VC-hit line into
+   L1; `victim_cache_install(l1_repl_addr, l1_victim_dirty_snap, …)`
+   pushes the L1 victim into the VC with the dirty bit we snapshotted.
+   Call `dcache_cacheline_hit` so the op completes as an L1 hit (that
+   function increments the read/write counters; we intentionally leave
+   them at zero before the call so they are not double-counted).
 
 **B. Install-on-eviction on L1 fill.** Inside `dcache_fill_get_cacheline()`,
 when VC is enabled and the fill is an on-path demand fill, skip the

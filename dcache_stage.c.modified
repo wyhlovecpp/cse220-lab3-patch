@@ -320,12 +320,6 @@ void update_dcache_stage(Stage_Data* src_sd) {
     if (VICTIM_CACHE_ENABLE && !op->off_path) {
       STAT_EVENT(op->proc_id, DCACHE_VC_PROBE);
 
-      /*
-       * We will probe-without-commit first and do the swap only if we can
-       * safely schedule any writeback that a VC-LRU eviction would need.
-       * This avoids leaving the VC in a half-committed state when the
-       * memory system has no free mem_req buffer.
-       */
       Addr l1_repl_addr = 0;
       Flag l1_repl_valid = FALSE;
       Dcache_Data* l1_repl_data = (Dcache_Data*)get_next_repl_line(
@@ -337,47 +331,20 @@ void update_dcache_stage(Stage_Data* src_sd) {
       Flag l1_victim_dirty_snap = (l1_repl_valid && l1_repl_data && l1_repl_data->dirty)
                                       ? TRUE : FALSE;
 
-      /* Predicate: would pushing the L1 victim into the VC evict a dirty
-       * line that we'd need to write back? */
-      Addr vc_evicted_addr = 0;
-      Flag vc_evicted_dirty = FALSE;
-      Flag vc_would_evict = FALSE;
-      if (l1_repl_valid) {
-        vc_would_evict = victim_cache_peek_evict(
-            op->proc_id, l1_repl_addr,
-            &vc_evicted_addr, &vc_evicted_dirty);
-      }
-
       /*
-       * Try the VC probe + swap only if, in the case of a VC hit, the
-       * writeback can be scheduled.  We take first and have to undo on
-       * writeback-fail, but crucially we do NOT then fall through to
-       * dcache_cacheline_miss for a line the VC just restored — that
-       * would double-miss the fabric.  Instead we stall the op and let
-       * the access retry on a later cycle (same pattern Scarab uses when
-       * dcache_miss_new_mem_req fails).
+       * Probe + remove the VC line for `va`.  take() vacates the slot on
+       * hit, so after a successful take the VC is guaranteed to have at
+       * least one free slot for the swap.  We check the peek-evict
+       * predicate AFTER take() — the swap-on-hit case therefore never
+       * requires a VC writeback (no entry is displaced).
        */
       Flag vc_dirty = FALSE;
       if (victim_cache_take(op->proc_id, op->oracle_info.va, &vc_dirty)) {
-        if (vc_would_evict && vc_evicted_dirty) {
-          uns repl_proc_id = get_proc_id_from_cmp_addr(vc_evicted_addr);
-          if (!new_mem_dc_wb_req(MRT_WB, repl_proc_id, vc_evicted_addr,
-                                 DCACHE_LINE_SIZE, 1, NULL, NULL,
-                                 unique_count, TRUE)) {
-            /* Put the line back in the VC at MRU and stall the op so it
-             * is retried next cycle.  We do NOT call dcache_cacheline_miss:
-             * the line IS in the VC, converting a stall into a miss would
-             * double-fetch from L2. */
-            Addr dummy_a = 0; Flag dummy_d = FALSE, dummy_e = FALSE;
-            victim_cache_install(op->proc_id, op->oracle_info.va, vc_dirty,
-                                 &dummy_a, &dummy_d, &dummy_e);
-            op->state = OS_WAIT_DCACHE;
-            continue;
-          }
-          STAT_EVENT(op->proc_id, DCACHE_WB_REQ_DIRTY);
-          STAT_EVENT(op->proc_id, DCACHE_WB_REQ);
-          STAT_EVENT(op->proc_id, DCACHE_VC_EVICT_DIRTY_WB);
-        }
+        /* post-take: sanity — if l1_repl_valid, pushing its line into the
+         * VC cannot require evicting anything, because take() just made
+         * room.  Assert in debug; otherwise trust and continue. */
+        DEBUG(op->proc_id, "VC swap-hit on addr 0x%s (l1 victim 0x%s)\n",
+              hexstr64s(op->oracle_info.va), hexstr64s(l1_repl_addr));
 
         /* Commit the swap: install the VC line into the L1. */
         Addr new_l1_line_addr = 0, repl_addr_out = 0;

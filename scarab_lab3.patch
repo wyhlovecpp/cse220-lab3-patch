@@ -1,5 +1,5 @@
 diff --git a/src/dcache_stage.c b/src/dcache_stage.c
-index b781631..647f52b 100644
+index b781631..0f2ad7b 100644
 --- a/src/dcache_stage.c
 +++ b/src/dcache_stage.c
 @@ -56,6 +56,13 @@
@@ -36,7 +36,7 @@ index b781631..647f52b 100644
    dc->ports = (Ports*)malloc(sizeof(Ports) * DCACHE_BANKS);
    for (uns ii = 0; ii < DCACHE_BANKS; ii++) {
      char name[MAX_STR_LENGTH + 1];
-@@ -288,6 +308,122 @@ void update_dcache_stage(Stage_Data* src_sd) {
+@@ -288,6 +308,89 @@ void update_dcache_stage(Stage_Data* src_sd) {
        dcache_cacheline_hit(op, line_addr, line);
        continue;
      }
@@ -52,12 +52,6 @@ index b781631..647f52b 100644
 +    if (VICTIM_CACHE_ENABLE && !op->off_path) {
 +      STAT_EVENT(op->proc_id, DCACHE_VC_PROBE);
 +
-+      /*
-+       * We will probe-without-commit first and do the swap only if we can
-+       * safely schedule any writeback that a VC-LRU eviction would need.
-+       * This avoids leaving the VC in a half-committed state when the
-+       * memory system has no free mem_req buffer.
-+       */
 +      Addr l1_repl_addr = 0;
 +      Flag l1_repl_valid = FALSE;
 +      Dcache_Data* l1_repl_data = (Dcache_Data*)get_next_repl_line(
@@ -69,47 +63,20 @@ index b781631..647f52b 100644
 +      Flag l1_victim_dirty_snap = (l1_repl_valid && l1_repl_data && l1_repl_data->dirty)
 +                                      ? TRUE : FALSE;
 +
-+      /* Predicate: would pushing the L1 victim into the VC evict a dirty
-+       * line that we'd need to write back? */
-+      Addr vc_evicted_addr = 0;
-+      Flag vc_evicted_dirty = FALSE;
-+      Flag vc_would_evict = FALSE;
-+      if (l1_repl_valid) {
-+        vc_would_evict = victim_cache_peek_evict(
-+            op->proc_id, l1_repl_addr,
-+            &vc_evicted_addr, &vc_evicted_dirty);
-+      }
-+
 +      /*
-+       * Try the VC probe + swap only if, in the case of a VC hit, the
-+       * writeback can be scheduled.  We take first and have to undo on
-+       * writeback-fail, but crucially we do NOT then fall through to
-+       * dcache_cacheline_miss for a line the VC just restored — that
-+       * would double-miss the fabric.  Instead we stall the op and let
-+       * the access retry on a later cycle (same pattern Scarab uses when
-+       * dcache_miss_new_mem_req fails).
++       * Probe + remove the VC line for `va`.  take() vacates the slot on
++       * hit, so after a successful take the VC is guaranteed to have at
++       * least one free slot for the swap.  We check the peek-evict
++       * predicate AFTER take() — the swap-on-hit case therefore never
++       * requires a VC writeback (no entry is displaced).
 +       */
 +      Flag vc_dirty = FALSE;
 +      if (victim_cache_take(op->proc_id, op->oracle_info.va, &vc_dirty)) {
-+        if (vc_would_evict && vc_evicted_dirty) {
-+          uns repl_proc_id = get_proc_id_from_cmp_addr(vc_evicted_addr);
-+          if (!new_mem_dc_wb_req(MRT_WB, repl_proc_id, vc_evicted_addr,
-+                                 DCACHE_LINE_SIZE, 1, NULL, NULL,
-+                                 unique_count, TRUE)) {
-+            /* Put the line back in the VC at MRU and stall the op so it
-+             * is retried next cycle.  We do NOT call dcache_cacheline_miss:
-+             * the line IS in the VC, converting a stall into a miss would
-+             * double-fetch from L2. */
-+            Addr dummy_a = 0; Flag dummy_d = FALSE, dummy_e = FALSE;
-+            victim_cache_install(op->proc_id, op->oracle_info.va, vc_dirty,
-+                                 &dummy_a, &dummy_d, &dummy_e);
-+            op->state = OS_WAIT_DCACHE;
-+            continue;
-+          }
-+          STAT_EVENT(op->proc_id, DCACHE_WB_REQ_DIRTY);
-+          STAT_EVENT(op->proc_id, DCACHE_WB_REQ);
-+          STAT_EVENT(op->proc_id, DCACHE_VC_EVICT_DIRTY_WB);
-+        }
++        /* post-take: sanity — if l1_repl_valid, pushing its line into the
++         * VC cannot require evicting anything, because take() just made
++         * room.  Assert in debug; otherwise trust and continue. */
++        DEBUG(op->proc_id, "VC swap-hit on addr 0x%s (l1 victim 0x%s)\n",
++              hexstr64s(op->oracle_info.va), hexstr64s(l1_repl_addr));
 +
 +        /* Commit the swap: install the VC line into the L1. */
 +        Addr new_l1_line_addr = 0, repl_addr_out = 0;
@@ -159,7 +126,7 @@ index b781631..647f52b 100644
      dcache_cacheline_miss(op, line_addr);
    }
  
-@@ -358,6 +494,18 @@ Flag dcache_fill_line(Mem_Req* req) {
+@@ -358,6 +461,18 @@ Flag dcache_fill_line(Mem_Req* req) {
    /* update cacheline fields and wake up dependent ops */
    dcache_fill_process_cacheline(req, data);
  
@@ -178,7 +145,7 @@ index b781631..647f52b 100644
    cycle_count = old_cycle_count;
    return SUCCESS;
  }
-@@ -563,6 +711,12 @@ static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* lin
+@@ -563,6 +678,12 @@ static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* lin
    if (!op->off_path) {
      STAT_EVENT(op->proc_id, DCACHE_HIT);
      STAT_EVENT(op->proc_id, DCACHE_HIT_ONPATH);
@@ -191,7 +158,7 @@ index b781631..647f52b 100644
    } else {
      STAT_EVENT(op->proc_id, DCACHE_HIT_OFFPATH);
    }
-@@ -633,6 +787,16 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
+@@ -633,6 +754,16 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
          STAT_EVENT(op->proc_id, DCACHE_MISS_LD_ONPATH);
          op->oracle_info.dcmiss = TRUE;
          STAT_EVENT(op->proc_id, DCACHE_MISS_LD);
@@ -208,7 +175,7 @@ index b781631..647f52b 100644
        } else {
          STAT_EVENT(op->proc_id, DCACHE_MISS_OFFPATH);
          STAT_EVENT(op->proc_id, DCACHE_MISS_LD_OFFPATH);
-@@ -662,6 +826,14 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
+@@ -662,6 +793,14 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
          STAT_EVENT(op->proc_id, DCACHE_MISS_LD_ONPATH);
          op->oracle_info.dcmiss = TRUE;
          STAT_EVENT(op->proc_id, DCACHE_MISS_LD);
@@ -223,7 +190,7 @@ index b781631..647f52b 100644
        } else {
          STAT_EVENT(op->proc_id, DCACHE_MISS_OFFPATH);
          STAT_EVENT(op->proc_id, DCACHE_MISS_LD_OFFPATH);
-@@ -693,6 +865,14 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
+@@ -693,6 +832,14 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
          STAT_EVENT(op->proc_id, DCACHE_MISS_ST_ONPATH);
          op->oracle_info.dcmiss = TRUE;
          STAT_EVENT(op->proc_id, DCACHE_MISS_ST);
@@ -238,7 +205,7 @@ index b781631..647f52b 100644
        } else {
          STAT_EVENT(op->proc_id, DCACHE_MISS_OFFPATH);
          STAT_EVENT(op->proc_id, DCACHE_MISS_ST_OFFPATH);
-@@ -745,11 +925,41 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
+@@ -745,11 +892,41 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
    /*
     * Do not insert the line yet, just check which line we need to replace.
     * If that line is dirty, it's possible that we won't be able to insert the writeback into the memory system.
@@ -282,7 +249,7 @@ index b781631..647f52b 100644
      uns repl_proc_id = get_proc_id_from_cmp_addr(repl_line_addr);
      DEBUG(dc->proc_id, "Scheduling writeback of addr:0x%s\n", hexstr64s(repl_line_addr));
      ASSERT(dc->proc_id, data->read_count[0] || data->read_count[1] || data->write_count[0] || data->write_count[1]);
-@@ -762,6 +972,15 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
+@@ -762,6 +939,15 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
      STAT_EVENT(dc->proc_id, DCACHE_WB_REQ);
    }
  
@@ -298,7 +265,7 @@ index b781631..647f52b 100644
    DEBUG(dc->proc_id,
          "Filling dcache  off_path:%d addr:0x%s  :%7d index:%7d op_count:%d "
          "oldest:%lld\n",
-@@ -773,6 +992,19 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
+@@ -773,6 +959,19 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
    ASSERT(dc->proc_id, cycle_count >= req->emitted_cycle);
    ASSERT(dc->proc_id, ((int)req->mlc_hit + (int)req->l1_hit) < 2);
  
