@@ -1,0 +1,361 @@
+diff --git a/src/dcache_stage.c b/src/dcache_stage.c
+index b781631..647f52b 100644
+--- a/src/dcache_stage.c
++++ b/src/dcache_stage.c
+@@ -56,6 +56,13 @@
+ #include "statistics.h"
+ #include "thread.h"
+ 
++/* CSE220 Lab2: 3C miss classifier (external C++ module). */
++#include "miss_classifier.h"
++#include "memory/mem_req.h"
++
++/* CSE220 Lab3: victim cache (external C++ module). */
++#include "victim_cache.h"
++
+ /**************************************************************************************/
+ /* Macros */
+ 
+@@ -108,6 +115,19 @@ void init_dcache_stage(uns8 proc_id, const char* name) {
+   init_cache(&dc->dcache, "DCACHE", DCACHE_SIZE, DCACHE_ASSOC, DCACHE_LINE_SIZE, sizeof(Dcache_Data), DCACHE_REPL);
+   reset_dcache_stage();
+ 
++  /* CSE220 Lab2: initialize 3C miss classifier with this dcache's geometry
++   * (number of lines and line size in bytes). */
++  miss_classifier_init((unsigned int)proc_id,
++                       (unsigned int)(DCACHE_SIZE / DCACHE_LINE_SIZE),
++                       (unsigned int)DCACHE_LINE_SIZE);
++
++  /* CSE220 Lab3: initialize the victim cache (Jouppi 1990) when enabled. */
++  if (VICTIM_CACHE_ENABLE) {
++    victim_cache_init((unsigned int)proc_id,
++                      (unsigned int)VICTIM_CACHE_ENTRIES,
++                      (unsigned int)DCACHE_LINE_SIZE);
++  }
++
+   dc->ports = (Ports*)malloc(sizeof(Ports) * DCACHE_BANKS);
+   for (uns ii = 0; ii < DCACHE_BANKS; ii++) {
+     char name[MAX_STR_LENGTH + 1];
+@@ -288,6 +308,122 @@ void update_dcache_stage(Stage_Data* src_sd) {
+       dcache_cacheline_hit(op, line_addr, line);
+       continue;
+     }
++
++    /*
++     * CSE220 Lab3: victim-cache probe (swap-on-hit, Jouppi 1990).
++     *
++     * We are about to take an L1 miss.  If the VC holds this line, install
++     * it into L1 (evicting a new victim into the VC) and treat the access
++     * as an L1 hit.  Only on-path demand accesses participate in VC
++     * bookkeeping; off-path accesses fall through to the normal miss path.
++     */
++    if (VICTIM_CACHE_ENABLE && !op->off_path) {
++      STAT_EVENT(op->proc_id, DCACHE_VC_PROBE);
++
++      /*
++       * We will probe-without-commit first and do the swap only if we can
++       * safely schedule any writeback that a VC-LRU eviction would need.
++       * This avoids leaving the VC in a half-committed state when the
++       * memory system has no free mem_req buffer.
++       */
++      Addr l1_repl_addr = 0;
++      Flag l1_repl_valid = FALSE;
++      Dcache_Data* l1_repl_data = (Dcache_Data*)get_next_repl_line(
++          &dc->dcache, op->proc_id, op->oracle_info.va,
++          &l1_repl_addr, &l1_repl_valid);
++
++      /* Snapshot the L1 victim's dirty bit NOW, before cache_insert can
++       * reuse/overwrite the Dcache_Data slot. */
++      Flag l1_victim_dirty_snap = (l1_repl_valid && l1_repl_data && l1_repl_data->dirty)
++                                      ? TRUE : FALSE;
++
++      /* Predicate: would pushing the L1 victim into the VC evict a dirty
++       * line that we'd need to write back? */
++      Addr vc_evicted_addr = 0;
++      Flag vc_evicted_dirty = FALSE;
++      Flag vc_would_evict = FALSE;
++      if (l1_repl_valid) {
++        vc_would_evict = victim_cache_peek_evict(
++            op->proc_id, l1_repl_addr,
++            &vc_evicted_addr, &vc_evicted_dirty);
++      }
++
++      /*
++       * Try the VC probe + swap only if, in the case of a VC hit, the
++       * writeback can be scheduled.  We take first and have to undo on
++       * writeback-fail, but crucially we do NOT then fall through to
++       * dcache_cacheline_miss for a line the VC just restored — that
++       * would double-miss the fabric.  Instead we stall the op and let
++       * the access retry on a later cycle (same pattern Scarab uses when
++       * dcache_miss_new_mem_req fails).
++       */
++      Flag vc_dirty = FALSE;
++      if (victim_cache_take(op->proc_id, op->oracle_info.va, &vc_dirty)) {
++        if (vc_would_evict && vc_evicted_dirty) {
++          uns repl_proc_id = get_proc_id_from_cmp_addr(vc_evicted_addr);
++          if (!new_mem_dc_wb_req(MRT_WB, repl_proc_id, vc_evicted_addr,
++                                 DCACHE_LINE_SIZE, 1, NULL, NULL,
++                                 unique_count, TRUE)) {
++            /* Put the line back in the VC at MRU and stall the op so it
++             * is retried next cycle.  We do NOT call dcache_cacheline_miss:
++             * the line IS in the VC, converting a stall into a miss would
++             * double-fetch from L2. */
++            Addr dummy_a = 0; Flag dummy_d = FALSE, dummy_e = FALSE;
++            victim_cache_install(op->proc_id, op->oracle_info.va, vc_dirty,
++                                 &dummy_a, &dummy_d, &dummy_e);
++            op->state = OS_WAIT_DCACHE;
++            continue;
++          }
++          STAT_EVENT(op->proc_id, DCACHE_WB_REQ_DIRTY);
++          STAT_EVENT(op->proc_id, DCACHE_WB_REQ);
++          STAT_EVENT(op->proc_id, DCACHE_VC_EVICT_DIRTY_WB);
++        }
++
++        /* Commit the swap: install the VC line into the L1. */
++        Addr new_l1_line_addr = 0, repl_addr_out = 0;
++        Dcache_Data* new_line = (Dcache_Data*)cache_insert(
++            &dc->dcache, op->proc_id, op->oracle_info.va,
++            &new_l1_line_addr, &repl_addr_out);
++
++        /* Minimal re-population of the line's metadata.  We do NOT seed
++         * read_count / write_count here — dcache_cacheline_hit below
++         * increments them, and preseeding would double-count. */
++        new_line->dirty = vc_dirty;
++        new_line->prefetch = FALSE;
++        new_line->HW_prefetch = FALSE;
++        new_line->HW_prefetched = FALSE;
++        new_line->read_count[0] = 0; new_line->read_count[1] = 0;
++        new_line->write_count[0] = 0; new_line->write_count[1] = 0;
++        new_line->misc_state = 0;
++        new_line->fetched_by_offpath = FALSE;
++        new_line->offpath_op_addr = 0;
++        new_line->offpath_op_unique = 0;
++        new_line->fetch_cycle = cycle_count;
++        new_line->onpath_use_cycle = cycle_count;
++
++        /* Push the L1 victim into the VC using the dirty bit we snapshotted
++         * BEFORE cache_insert ran (otherwise the slot has been overwritten
++         * by the just-installed new_line's metadata). */
++        if (l1_repl_valid) {
++          Addr e_a = 0; Flag e_d = FALSE, did = FALSE;
++          victim_cache_install(op->proc_id, l1_repl_addr,
++                               l1_victim_dirty_snap,
++                               &e_a, &e_d, &did);
++          STAT_EVENT(op->proc_id, DCACHE_VC_INSTALL);
++          if (did)
++            STAT_EVENT(op->proc_id, DCACHE_VC_EVICT);
++        }
++
++        STAT_EVENT(op->proc_id, DCACHE_VC_HIT);
++
++        /* Treat as an L1 hit. dcache_cacheline_hit emits DCACHE_HIT_ONPATH
++         * and increments the line's read/write counters — we intentionally
++         * left them at zero above so they are not double-counted. */
++        dcache_cacheline_hit(op, new_l1_line_addr, new_line);
++        continue;
++      }
++    }
++
+     dcache_cacheline_miss(op, line_addr);
+   }
+ 
+@@ -358,6 +494,18 @@ Flag dcache_fill_line(Mem_Req* req) {
+   /* update cacheline fields and wake up dependent ops */
+   dcache_fill_process_cacheline(req, data);
+ 
++  /*
++   * CSE220 Lab2: after a successful demand fill, install the line into the
++   * 3C shadow FA cache so future probes see it.  This is the ONLY place
++   * that mutates ever_seen / FA-LRU from the miss side; classification
++   * itself happens at DCACHE_MISS_ONPATH emission in dcache_cacheline_miss.
++   * Skip prefetch / writeback / off-path fills.
++   */
++  if (!req->off_path && req->type != MRT_DPRF && req->type != MRT_WB &&
++      req->type != MRT_WB_NODIRTY) {
++    miss_classifier_install(req->proc_id, (unsigned long long)req->addr);
++  }
++
+   cycle_count = old_cycle_count;
+   return SUCCESS;
+ }
+@@ -563,6 +711,12 @@ static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* lin
+   if (!op->off_path) {
+     STAT_EVENT(op->proc_id, DCACHE_HIT);
+     STAT_EVENT(op->proc_id, DCACHE_HIT_ONPATH);
++
++    /* CSE220 Lab2: observe on-path hits so the 3C shadow FA cache sees the
++     * full access stream (otherwise its LRU order diverges from the real
++     * cache and fully-associative runs still show a few "conflict" misses). */
++    miss_classifier_observe_hit(op->proc_id,
++                                (unsigned long long)op->oracle_info.va);
+   } else {
+     STAT_EVENT(op->proc_id, DCACHE_HIT_OFFPATH);
+   }
+@@ -633,6 +787,16 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
+         STAT_EVENT(op->proc_id, DCACHE_MISS_LD_ONPATH);
+         op->oracle_info.dcmiss = TRUE;
+         STAT_EVENT(op->proc_id, DCACHE_MISS_LD);
++        /* CSE220 Lab2: probe-classify at the DCACHE_MISS_ONPATH emission
++         * point so 3C counters partition it 1:1.  No shadow-state update
++         * here — install happens in dcache_fill_line SUCCESS. */
++        {
++          int tag = miss_classifier_classify_probe(
++              op->proc_id, (unsigned long long)op->oracle_info.va);
++          if (tag == 0)      STAT_EVENT(op->proc_id, DCACHE_MISS_3C_COMPULSORY);
++          else if (tag == 1) STAT_EVENT(op->proc_id, DCACHE_MISS_3C_CAPACITY);
++          else               STAT_EVENT(op->proc_id, DCACHE_MISS_3C_CONFLICT);
++        }
+       } else {
+         STAT_EVENT(op->proc_id, DCACHE_MISS_OFFPATH);
+         STAT_EVENT(op->proc_id, DCACHE_MISS_LD_OFFPATH);
+@@ -662,6 +826,14 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
+         STAT_EVENT(op->proc_id, DCACHE_MISS_LD_ONPATH);
+         op->oracle_info.dcmiss = TRUE;
+         STAT_EVENT(op->proc_id, DCACHE_MISS_LD);
++        /* CSE220 Lab2: probe-classify (MEM_PF / MEM_WH demand miss). */
++        {
++          int tag = miss_classifier_classify_probe(
++              op->proc_id, (unsigned long long)op->oracle_info.va);
++          if (tag == 0)      STAT_EVENT(op->proc_id, DCACHE_MISS_3C_COMPULSORY);
++          else if (tag == 1) STAT_EVENT(op->proc_id, DCACHE_MISS_3C_CAPACITY);
++          else               STAT_EVENT(op->proc_id, DCACHE_MISS_3C_CONFLICT);
++        }
+       } else {
+         STAT_EVENT(op->proc_id, DCACHE_MISS_OFFPATH);
+         STAT_EVENT(op->proc_id, DCACHE_MISS_LD_OFFPATH);
+@@ -693,6 +865,14 @@ static inline void dcache_cacheline_miss(Op* op, Addr line_addr) {
+         STAT_EVENT(op->proc_id, DCACHE_MISS_ST_ONPATH);
+         op->oracle_info.dcmiss = TRUE;
+         STAT_EVENT(op->proc_id, DCACHE_MISS_ST);
++        /* CSE220 Lab2: probe-classify (store-miss). */
++        {
++          int tag = miss_classifier_classify_probe(
++              op->proc_id, (unsigned long long)op->oracle_info.va);
++          if (tag == 0)      STAT_EVENT(op->proc_id, DCACHE_MISS_3C_COMPULSORY);
++          else if (tag == 1) STAT_EVENT(op->proc_id, DCACHE_MISS_3C_CAPACITY);
++          else               STAT_EVENT(op->proc_id, DCACHE_MISS_3C_CONFLICT);
++        }
+       } else {
+         STAT_EVENT(op->proc_id, DCACHE_MISS_OFFPATH);
+         STAT_EVENT(op->proc_id, DCACHE_MISS_ST_OFFPATH);
+@@ -745,11 +925,41 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
+   /*
+    * Do not insert the line yet, just check which line we need to replace.
+    * If that line is dirty, it's possible that we won't be able to insert the writeback into the memory system.
++   *
++   * CSE220 Lab3: when the victim cache is enabled, we defer the writeback
++   * until the line is evicted from the VC (Jouppi 1990).  Only if pushing
++   * the L1 victim into the VC would in turn evict a dirty VC entry do we
++   * issue a writeback right now — in which case the writeback-may-fail
++   * deadlock-avoidance path is exactly the same as the baseline.
+    */
+   Flag repl_line_valid;
+   data = (Dcache_Data*)get_next_repl_line(&dc->dcache, dc->proc_id, req->addr, &repl_line_addr, &repl_line_valid);
+-  if (repl_line_valid && data->dirty) {
+-    /* need to do a write-back */
++
++  Flag vc_active = VICTIM_CACHE_ENABLE && !is_off_path && !is_prefetch &&
++                   req->type != MRT_WB && req->type != MRT_WB_NODIRTY &&
++                   repl_line_valid;
++
++  if (vc_active) {
++    /* Path: L1 victim goes into the VC.  If the VC is full, an LRU-evict
++     * may need a writeback now. */
++    Addr vc_evicted_addr = 0;
++    Flag vc_evicted_dirty = FALSE;
++    Flag vc_would_evict = victim_cache_peek_evict(
++        dc->proc_id, repl_line_addr, &vc_evicted_addr, &vc_evicted_dirty);
++
++    if (vc_would_evict && vc_evicted_dirty) {
++      uns repl_proc_id = get_proc_id_from_cmp_addr(vc_evicted_addr);
++      if (!new_mem_dc_wb_req(MRT_WB, repl_proc_id, vc_evicted_addr,
++                             DCACHE_LINE_SIZE, 1, NULL, NULL,
++                             unique_count, TRUE)) {
++        return NULL;
++      }
++      STAT_EVENT(dc->proc_id, DCACHE_WB_REQ_DIRTY);
++      STAT_EVENT(dc->proc_id, DCACHE_WB_REQ);
++      STAT_EVENT(dc->proc_id, DCACHE_VC_EVICT_DIRTY_WB);
++    }
++  } else if (repl_line_valid && data->dirty) {
++    /* Baseline path: no VC — dirty L1 victim goes straight to writeback. */
+     uns repl_proc_id = get_proc_id_from_cmp_addr(repl_line_addr);
+     DEBUG(dc->proc_id, "Scheduling writeback of addr:0x%s\n", hexstr64s(repl_line_addr));
+     ASSERT(dc->proc_id, data->read_count[0] || data->read_count[1] || data->write_count[0] || data->write_count[1]);
+@@ -762,6 +972,15 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
+     STAT_EVENT(dc->proc_id, DCACHE_WB_REQ);
+   }
+ 
++  /* If VC is active, capture the L1 victim's dirty bit BEFORE the
++   * cache_insert overwrites the Dcache_Data payload. */
++  Flag l1_victim_dirty = FALSE;
++  Addr l1_victim_addr_saved = 0;
++  if (vc_active) {
++    l1_victim_dirty = data->dirty ? TRUE : FALSE;
++    l1_victim_addr_saved = repl_line_addr;
++  }
++
+   DEBUG(dc->proc_id,
+         "Filling dcache  off_path:%d addr:0x%s  :%7d index:%7d op_count:%d "
+         "oldest:%lld\n",
+@@ -773,6 +992,19 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
+   ASSERT(dc->proc_id, cycle_count >= req->emitted_cycle);
+   ASSERT(dc->proc_id, ((int)req->mlc_hit + (int)req->l1_hit) < 2);
+ 
++  /* CSE220 Lab3: push the L1 victim into the VC.  The writeback for the
++   * VC-LRU (if it was dirty) was already scheduled above under vc_active;
++   * calling install here is safe because the peek matched the actual
++   * install semantics. */
++  if (vc_active) {
++    Addr e_a = 0; Flag e_d = FALSE, did = FALSE;
++    victim_cache_install(dc->proc_id, l1_victim_addr_saved, l1_victim_dirty,
++                         &e_a, &e_d, &did);
++    STAT_EVENT(dc->proc_id, DCACHE_VC_INSTALL);
++    if (did)
++      STAT_EVENT(dc->proc_id, DCACHE_VC_EVICT);
++  }
++
+   STAT_EVENT(dc->proc_id, DCACHE_FILL);
+   INC_STAT_EVENT(dc->proc_id, DATA_LD_CYCLES_ONPATH + req->off_path, cycle_count - req->emitted_cycle);
+   if (req->mlc_hit) {
+diff --git a/src/memory/memory.param.def b/src/memory/memory.param.def
+index 40e1ab9..0c49022 100644
+--- a/src/memory/memory.param.def
++++ b/src/memory/memory.param.def
+@@ -250,6 +250,11 @@ DEF_PARAM(allow_type_matches, ALLOW_TYPE_MATCHES, Flag, Flag, FALSE, )
+ /* prefetcher */
+ DEF_PARAM(stream_prefetch_on, STREAM_PREFETCH_ON, Flag, Flag, FALSE, )
+ 
++/* CSE220 Lab 3: victim cache (Jouppi 1990, ISCA) — small fully-associative
++ * LRU cache on the refill path between L1 dcache and L2. */
++DEF_PARAM(victim_cache_enable,  VICTIM_CACHE_ENABLE,  Flag, Flag, FALSE, )
++DEF_PARAM(victim_cache_entries, VICTIM_CACHE_ENTRIES, uns,  uns,  5,     )
++
+ /* dcache prefetcher cache */
+ DEF_PARAM(dc_pref_cache_enable, DC_PREF_CACHE_ENABLE, Flag, Flag, FALSE, )
+ DEF_PARAM(dc_pref_cache_cycle, DC_PREF_CACHE_CYCLE, uns, uns, 0, )
+diff --git a/src/memory/memory.stat.def b/src/memory/memory.stat.def
+index 82d8462..6d4dda2 100644
+--- a/src/memory/memory.stat.def
++++ b/src/memory/memory.stat.def
+@@ -226,6 +226,20 @@ DEF_STAT(  DCACHE_MISS_ST_OFFPATH	   , DIST  , NO_RATIO  )
+ 
+ DEF_STAT(  DCACHE_MISS_WAITMEM             , COUNT , NO_RATIO  ) // DCACHE could not insert request into L2
+ 
++// CSE220 Lab2: 3C classification counters for on-path dcache miss events;
++// shadow state is updated on successful on-path demand-line installs and on
++// on-path hits (see miss_classifier.{h,cc}).
++DEF_STAT(  DCACHE_MISS_3C_COMPULSORY       , COUNT , NO_RATIO  )
++DEF_STAT(  DCACHE_MISS_3C_CAPACITY         , COUNT , NO_RATIO  )
++DEF_STAT(  DCACHE_MISS_3C_CONFLICT         , COUNT , NO_RATIO  )
++
++// CSE220 Lab3: victim-cache counters.
++DEF_STAT(  DCACHE_VC_PROBE                 , COUNT , NO_RATIO  ) // probes attempted
++DEF_STAT(  DCACHE_VC_HIT                   , COUNT , NO_RATIO  ) // on-path L1 miss that hit in the VC
++DEF_STAT(  DCACHE_VC_INSTALL               , COUNT , NO_RATIO  ) // lines pushed into the VC on L1 eviction
++DEF_STAT(  DCACHE_VC_EVICT                 , COUNT , NO_RATIO  ) // lines LRU-evicted from the VC
++DEF_STAT(  DCACHE_VC_EVICT_DIRTY_WB        , COUNT , NO_RATIO  ) // VC evictions that triggered a writeback
++
+ //Page mode row buffer hit or miss
+ DEF_STAT(  MEM_REQ_ROW_BUFFER_HITS	       , DIST  , NO_RATIO  )
+ DEF_STAT(  MEM_REQ_ROW_BUFFER_MISSES	   , COUNT , NO_RATIO  )  
