@@ -95,7 +95,13 @@ make opt
 * VC off: all the Lab 2 invariants still hold; the 3C counters partition
   `DCACHE_MISS_ONPATH` exactly on every run.
 * VC on (5 entries): mean miss ratio dropped from 0.280 to 0.268 across
-  the 10-benchmark mix; VC hit rate ≈ 18% of L1 misses.
+  the 10-benchmark mix. The arithmetic mean of per-benchmark
+  `VC_Hit / VC_Probe` is ≈ 0.053 (i.e. the 5-entry VC serves ~5% of the
+  on-path L1 misses it sees on average across the 10 benchmarks).
+  Benchmarks with substantial locality captured by the VC (perlbench,
+  omnetpp, roms) push that per-benchmark hit rate up to 0.08–0.25;
+  memory-bound streaming benchmarks (lbm, imagick) sit near zero because
+  their miss stream is dominated by never-revisited lines.
 * Sensitivity sweep (VC sizes 0/1/2/5/10/20): miss ratio decreases
   monotonically; knee of diminishing returns at ~5 entries, matching
   Jouppi TN-14 §3.1.
